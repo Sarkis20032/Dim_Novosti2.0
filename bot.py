@@ -2,25 +2,23 @@ import os
 import asyncio
 import logging
 import sys
+import time
 from datetime import datetime
-from aiogram import Bot, Dispatcher, types
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    ReplyKeyboardMarkup, 
-    KeyboardButton, 
-    InlineKeyboardMarkup, 
-    InlineKeyboardButton, 
-    ReplyKeyboardRemove
-)
-from aiogram.filters import Command
-import psycopg2
 from urllib.parse import urlparse
 
-# Настройка event loop для Windows
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+import psycopg2
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -31,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 # Инициализация бота
 API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+if not API_TOKEN:
+    logger.critical("Не установлен TELEGRAM_BOT_TOKEN!")
+    sys.exit(1)
+
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -38,20 +40,35 @@ dp = Dispatcher(storage=storage)
 # Функция для подключения к PostgreSQL
 def get_db_connection():
     db_url = os.getenv('DATABASE_URL')
-    result = urlparse(db_url)
-    conn = psycopg2.connect(
-        dbname=result.path[1:],
-        user=result.username,
-        password=result.password,
-        host=result.hostname,
-        port=result.port
-    )
-    return conn
+    if not db_url:
+        raise ValueError("DATABASE_URL environment variable is not set")
+
+    try:
+        if db_url.startswith('postgresql://'):
+            result = urlparse(db_url)
+            conn = psycopg2.connect(
+                dbname=result.path[1:],
+                user=result.username,
+                password=result.password,
+                host=result.hostname,
+                port=result.port,
+                connect_timeout=5
+            )
+        else:
+            conn = psycopg2.connect(db_url, sslmode='require')
+        
+        return conn
+    except psycopg2.OperationalError as e:
+        logger.error(f"Ошибка подключения к PostgreSQL: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при подключении к БД: {e}")
+        raise
 
 # Клавиатуры
 def make_keyboard(items, row_width=2):
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=item) for item in items[i:i+row_width]] 
+        keyboard=[[KeyboardButton(text=item) for item in items[i:i+row_width]]
                  for i in range(0, len(items), row_width)],
         resize_keyboard=True,
         one_time_keyboard=True
@@ -62,11 +79,19 @@ AGE_KEYBOARD = make_keyboard(["До 22", "22-30", "Более 30"])
 VISIT_KEYBOARD = make_keyboard(["До 3 раз", "3-8 раз", "Более 8 раз"])
 YES_NO_KEYBOARD = make_keyboard(["Да", "Нет"])
 ADMIN_KEYBOARD = make_keyboard([
-    "📊 Отчёт по базе", 
-    "👥 Список админов", 
+    "📊 Отчёт по базе",
+    "👥 Список админов",
     "➕ Добавить админа",
     "🗑️ Очистить админов",
     "🧹 Очистить базу",
+    "📢 Сделать рассылку",
+    "💬 Чат с клиентом",
+    "📋 Подробный отчёт",
+    "🔙 Назад"
+])
+REGULAR_ADMIN_KEYBOARD = make_keyboard([
+    "📊 Отчёт по базе",
+    "👥 Список админов",
     "📢 Сделать рассылку",
     "💬 Чат с клиентом",
     "📋 Подробный отчёт",
@@ -95,58 +120,69 @@ class AdminStates(StatesGroup):
 
 # Инициализация базы данных
 def init_db():
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            added_by BIGINT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-        
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS clients (
-            user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            full_name TEXT,
-            appreciate TEXT,
-            dislike TEXT,
-            improve TEXT,
-            gender TEXT,
-            age_group TEXT,
-            visit_freq TEXT,
-            is_admin BOOLEAN DEFAULT FALSE,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-        
-        # Добавляем основного админа
-        cursor.execute('''
-        INSERT INTO admins (user_id, username, added_by) 
-        VALUES (%s, %s, %s)
-        ON CONFLICT (user_id) DO NOTHING
-        ''', (641521378, "sarkis_20032", 641521378))
-        
-        conn.commit()
-    except Exception as e:
-        logger.error(f"Ошибка инициализации БД: {e}")
-        raise
-    finally:
-        if conn:
-            conn.close()
+    max_retries = 3
+    retry_delay = 2  # секунды
+    
+    for attempt in range(max_retries):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS clients (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                appreciate TEXT,
+                dislike TEXT,
+                improve TEXT,
+                gender TEXT,
+                age_group TEXT,
+                visit_freq TEXT,
+                is_admin BOOLEAN DEFAULT FALSE,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            
+            # Добавляем основного админа
+            cursor.execute('''
+            INSERT INTO admins (user_id, username, added_by)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO NOTHING
+            ''', (641521378, "sarkis_20032", 641521378))
+            
+            conn.commit()
+            logger.info("База данных успешно инициализирована")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка инициализации БД (попытка {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+        finally:
+            if conn:
+                conn.close()
+    
+    logger.critical("Не удалось инициализировать базу данных после нескольких попыток")
+    return False
 
 # Проверка прав администратора
 def is_admin(user_id: int) -> bool:
+    if user_id == 641521378:  # Принудительный доступ для основного админа
+        return True
+        
     conn = None
     try:
-        if user_id == 641521378:  # Принудительный доступ для основного админа
-            return True
-            
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT 1 FROM admins WHERE user_id = %s', (user_id,))
@@ -202,11 +238,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
         if cursor.fetchone():
             if not admin_status:
                 await message.answer("Вы уже проходили анкету. Хотите пройти её ещё раз?", 
-                                  reply_markup=YES_NO_KEYBOARD)
+                                   reply_markup=YES_NO_KEYBOARD)
             else:
                 await message.answer("Вы уже проходили анкету. Хотите пройти её ещё раз?\n"
-                                  "Или перейти в админ-панель: /admin", 
-                                  reply_markup=YES_NO_KEYBOARD)
+                                   "Или перейти в админ-панель: /admin", 
+                                   reply_markup=YES_NO_KEYBOARD)
             await state.set_state(Questionnaire.WANT_HELP)
             await state.update_data(is_admin=admin_status)
         else:
@@ -229,6 +265,28 @@ async def cmd_start(message: types.Message, state: FSMContext):
     finally:
         if conn:
             conn.close()
+
+@dp.message(Command('admin'))
+async def admin_panel(message: types.Message):
+    try:
+        user_id = message.from_user.id
+        
+        if not is_admin(user_id):
+            await message.answer("⛔ У вас нет прав администратора")
+            return
+        
+        if message.chat.type != 'private':
+            await message.answer("🔒 Админ-панель доступна только в личных сообщениях")
+            return
+        
+        # Показываем разные клавиатуры для суперадмина и обычных админов
+        if is_super_admin(user_id):
+            await message.answer("👨‍💻 Админ-панель (суперадмин):", reply_markup=ADMIN_KEYBOARD)
+        else:
+            await message.answer("👨‍💻 Админ-панель:", reply_markup=REGULAR_ADMIN_KEYBOARD)
+    except Exception as e:
+        logger.error(f"Ошибка админ-панели: {e}")
+        await message.answer("⚠️ Ошибка доступа к админ-панели")
 
 # ========== ОБРАБОТЧИКИ АНКЕТЫ ==========
 
@@ -417,24 +475,6 @@ async def process_visit_freq(message: types.Message, state: FSMContext):
 
 # ========== АДМИН-ПАНЕЛЬ ==========
 
-@dp.message(Command('admin'))
-async def admin_panel(message: types.Message):
-    try:
-        user_id = message.from_user.id
-        
-        if not is_admin(user_id):
-            await message.answer("⛔ У вас нет прав администратора")
-            return
-        
-        if message.chat.type != 'private':
-            await message.answer("🔒 Админ-панель доступна только в личных сообщениях")
-            return
-            
-        await message.answer("👨‍💻 Админ-панель:", reply_markup=ADMIN_KEYBOARD)
-    except Exception as e:
-        logger.error(f"Ошибка админ-панели: {e}")
-        await message.answer("⚠️ Ошибка доступа к админ-панели")
-
 @dp.message(lambda m: m.text == "📊 Отчёт по базе" and is_admin(m.from_user.id))
 async def database_report(message: types.Message):
     conn = None
@@ -519,6 +559,10 @@ async def list_admins(message: types.Message):
 @dp.message(lambda m: m.text == "➕ Добавить админа" and is_admin(m.from_user.id))
 async def add_admin_start(message: types.Message, state: FSMContext):
     try:
+        if not is_super_admin(message.from_user.id):
+            await message.answer("⛔ Только главный администратор может добавлять новых админов")
+            return
+            
         await message.answer(
             "Введите ID пользователя, которого хотите сделать админом:",
             reply_markup=CANCEL_KEYBOARD
@@ -654,9 +698,12 @@ async def confirm_clear_admins(callback: types.CallbackQuery):
         # Удаляем всех админов, кроме текущего
         cursor.execute('DELETE FROM admins WHERE user_id != %s', (callback.from_user.id,))
         
-        # Добавляем текущего админа обратно, если его нет (на всякий случай)
-        cursor.execute('INSERT INTO admins (user_id, username, added_by) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING',
-                      (callback.from_user.id, callback.from_user.username, callback.from_user.id))
+        # Добавляем текущего админа обратно, если его нет
+        cursor.execute('''
+        INSERT INTO admins (user_id, username, added_by)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO NOTHING
+        ''', (callback.from_user.id, callback.from_user.username, callback.from_user.id))
         
         conn.commit()
         
@@ -690,6 +737,10 @@ async def cancel_clear_admins(callback: types.CallbackQuery):
 @dp.message(lambda m: m.text == "🧹 Очистить базу" and is_admin(m.from_user.id))
 async def clear_database_start(message: types.Message):
     try:
+        if not is_super_admin(message.from_user.id):
+            await message.answer("⛔ У вас недостаточно прав для этой операции")
+            return
+            
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Да, очистить", callback_data="confirm_clear")],
             [InlineKeyboardButton(text="❌ Нет, отменить", callback_data="cancel_clear")]
@@ -706,6 +757,10 @@ async def clear_database_start(message: types.Message):
 
 @dp.callback_query(lambda c: c.data == "confirm_clear")
 async def confirm_clear_db(callback: types.CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        await callback.answer("⛔ У вас недостаточно прав", show_alert=True)
+        return
+        
     conn = None
     try:
         conn = get_db_connection()
@@ -948,9 +1003,6 @@ async def detailed_clients_report(message: types.Message):
         if current_message:
             await message.answer(current_message)
 
-    except sqlite3.Error as e:
-        logger.error(f"Ошибка базы данных: {e}")
-        await message.answer("⚠️ Ошибка доступа к базе данных")
     except Exception as e:
         logger.error(f"Ошибка формирования отчёта: {e}")
         await message.answer("⚠️ Произошла непредвиденная ошибка")
@@ -962,7 +1014,10 @@ async def detailed_clients_report(message: types.Message):
 async def back_to_admin_menu(message: types.Message, state: FSMContext):
     try:
         await state.clear()
-        await message.answer("Главное меню админ-панели:", reply_markup=ADMIN_KEYBOARD)
+        if is_super_admin(message.from_user.id):
+            await message.answer("Главное меню админ-панели:", reply_markup=ADMIN_KEYBOARD)
+        else:
+            await message.answer("Главное меню админ-панели:", reply_markup=REGULAR_ADMIN_KEYBOARD)
     except Exception as e:
         logger.error(f"Ошибка возврата в меню: {e}")
 
@@ -994,49 +1049,14 @@ async def forward_client_message(message: types.Message):
         if conn:
             conn.close()
 
-# ========== ДИАГНОСТИКА ==========
-
-@dp.message(Command('debug'))
-async def debug_info(message: types.Message):
-    conn = None
-    try:
-        user_id = message.from_user.id
-        is_adm = is_admin(user_id)
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM admins WHERE user_id = %s', (user_id,))
-        admin_data = cursor.fetchone()
-        
-        cursor.execute('SELECT * FROM clients WHERE user_id = %s', (user_id,))
-        client_data = cursor.fetchone()
-        
-        response = (
-            f"🔧 Debug информация:\n"
-            f"🆔 Ваш ID: {user_id}\n"
-            f"👨‍💻 Вы админ: {'✅ Да' if is_adm else '❌ Нет'}\n"
-            f"👑 Вы суперадмин: {'✅ Да' if is_super_admin(user_id) else '❌ Нет'}\n"
-            f"📊 Данные в таблице админов: {admin_data}\n"
-            f"📝 Данные в таблице клиентов: {client_data}\n\n"
-            f"ℹ️ Для доступа к админ-панели используйте /admin"
-        )
-        
-        await message.answer(response)
-    except Exception as e:
-        logger.error(f"Ошибка debug: {e}")
-        await message.answer("⚠️ Ошибка получения debug информации")
-    finally:
-        if conn:
-            conn.close()
-
 # ========== ЗАПУСК БОТА ==========
 
 async def main():
+    if not init_db():
+        logger.critical("Не удалось подключиться к базе данных. Завершение работы.")
+        return
+    
     try:
-        # Инициализация базы данных
-        init_db()
-        
         logger.info("Бот запускается...")
         await dp.start_polling(bot)
     except Exception as e:
