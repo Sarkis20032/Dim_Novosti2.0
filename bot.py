@@ -1,8 +1,7 @@
-import sys
+import os
 import asyncio
 import logging
-import sqlite3
-import os
+import sys
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -16,6 +15,8 @@ from aiogram.types import (
     ReplyKeyboardRemove
 )
 from aiogram.filters import Command
+import psycopg2
+from urllib.parse import urlparse
 
 # Настройка event loop для Windows
 if sys.platform == 'win32':
@@ -29,10 +30,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Инициализация бота
-API_TOKEN = os.getenv('API_TOKEN')
+API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+# Функция для подключения к PostgreSQL
+def get_db_connection():
+    db_url = os.getenv('DATABASE_URL')
+    result = urlparse(db_url)
+    conn = psycopg2.connect(
+        dbname=result.path[1:],
+        user=result.username,
+        password=result.password,
+        host=result.hostname,
+        port=result.port
+    )
+    return conn
 
 # Клавиатуры
 def make_keyboard(items, row_width=2):
@@ -83,21 +97,21 @@ class AdminStates(StatesGroup):
 def init_db():
     conn = None
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             username TEXT,
-            added_by INTEGER,
-            added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            added_by BIGINT,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
         
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS clients (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             username TEXT,
             full_name TEXT,
             appreciate TEXT,
@@ -106,19 +120,16 @@ def init_db():
             gender TEXT,
             age_group TEXT,
             visit_freq TEXT,
-            is_admin BOOLEAN DEFAULT 0,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            is_admin BOOLEAN DEFAULT FALSE,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
         
-        cursor.execute("PRAGMA table_info(clients)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if 'is_admin' not in columns:
-            cursor.execute('ALTER TABLE clients ADD COLUMN is_admin BOOLEAN DEFAULT 0')
-        
+        # Добавляем основного админа
         cursor.execute('''
-        INSERT OR IGNORE INTO admins (user_id, username, added_by) 
-        VALUES (?, ?, ?)
+        INSERT INTO admins (user_id, username, added_by) 
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO NOTHING
         ''', (641521378, "sarkis_20032", 641521378))
         
         conn.commit()
@@ -136,9 +147,9 @@ def is_admin(user_id: int) -> bool:
         if user_id == 641521378:  # Принудительный доступ для основного админа
             return True
             
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT 1 FROM admins WHERE user_id = %s', (user_id,))
         return cursor.fetchone() is not None
     except Exception as e:
         logger.error(f"Ошибка проверки админа: {e}")
@@ -147,7 +158,7 @@ def is_admin(user_id: int) -> bool:
         if conn:
             conn.close()
 
-# Проверка на главного администратора (только вы)
+# Проверка на главного администратора
 def is_super_admin(user_id: int) -> bool:
     return user_id == 641521378
 
@@ -155,7 +166,7 @@ def is_super_admin(user_id: int) -> bool:
 async def notify_admins(text: str, exclude_id=None):
     conn = None
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT user_id FROM admins')
         admins = cursor.fetchall()
@@ -184,18 +195,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
         user_id = message.from_user.id
         admin_status = is_admin(user_id)
         
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT 1 FROM clients WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT 1 FROM clients WHERE user_id = %s', (user_id,))
         
         if cursor.fetchone():
             if not admin_status:
                 await message.answer("Вы уже проходили анкету. Хотите пройти её ещё раз?", 
-                                   reply_markup=YES_NO_KEYBOARD)
+                                  reply_markup=YES_NO_KEYBOARD)
             else:
                 await message.answer("Вы уже проходили анкету. Хотите пройти её ещё раз?\n"
-                                   "Или перейти в админ-панель: /admin", 
-                                   reply_markup=YES_NO_KEYBOARD)
+                                  "Или перейти в админ-панель: /admin", 
+                                  reply_markup=YES_NO_KEYBOARD)
             await state.set_state(Questionnaire.WANT_HELP)
             await state.update_data(is_admin=admin_status)
         else:
@@ -332,14 +343,25 @@ async def process_visit_freq(message: types.Message, state: FSMContext):
         user_data = await state.get_data()
         
         # Сохраняем данные в базу
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
-        INSERT OR REPLACE INTO clients (
+        INSERT INTO clients (
             user_id, username, full_name, appreciate, dislike, 
             improve, gender, age_group, visit_freq, is_admin
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            username = EXCLUDED.username,
+            full_name = EXCLUDED.full_name,
+            appreciate = EXCLUDED.appreciate,
+            dislike = EXCLUDED.dislike,
+            improve = EXCLUDED.improve,
+            gender = EXCLUDED.gender,
+            age_group = EXCLUDED.age_group,
+            visit_freq = EXCLUDED.visit_freq,
+            is_admin = EXCLUDED.is_admin,
+            timestamp = CURRENT_TIMESTAMP
         ''', (
             message.from_user.id,
             user_data.get('username'),
@@ -417,7 +439,7 @@ async def admin_panel(message: types.Message):
 async def database_report(message: types.Message):
     conn = None
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute('SELECT COUNT(*) FROM clients')
@@ -464,7 +486,7 @@ async def database_report(message: types.Message):
 async def list_admins(message: types.Message):
     conn = None
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
         SELECT a.user_id, a.username, u.username as added_by_username, a.added_at
@@ -531,10 +553,10 @@ async def add_admin_finish(message: types.Message, state: FSMContext):
             new_admin_username = "неизвестно"
             new_admin_fullname = "неизвестно"
         
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         
-        cursor.execute('SELECT 1 FROM admins WHERE user_id = ?', (new_admin_id,))
+        cursor.execute('SELECT 1 FROM admins WHERE user_id = %s', (new_admin_id,))
         if cursor.fetchone():
             await message.answer("Этот пользователь уже является админом", reply_markup=ADMIN_KEYBOARD)
             await state.clear()
@@ -542,7 +564,7 @@ async def add_admin_finish(message: types.Message, state: FSMContext):
         
         cursor.execute('''
         INSERT INTO admins (user_id, username, added_by)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
         ''', (
             new_admin_id,
             new_admin_username,
@@ -626,14 +648,14 @@ async def confirm_clear_admins(callback: types.CallbackQuery):
         
     conn = None
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         # Удаляем всех админов, кроме текущего
-        cursor.execute('DELETE FROM admins WHERE user_id != ?', (callback.from_user.id,))
+        cursor.execute('DELETE FROM admins WHERE user_id != %s', (callback.from_user.id,))
         
         # Добавляем текущего админа обратно, если его нет (на всякий случай)
-        cursor.execute('INSERT OR IGNORE INTO admins (user_id, username, added_by) VALUES (?, ?, ?)',
+        cursor.execute('INSERT INTO admins (user_id, username, added_by) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING',
                       (callback.from_user.id, callback.from_user.username, callback.from_user.id))
         
         conn.commit()
@@ -686,7 +708,7 @@ async def clear_database_start(message: types.Message):
 async def confirm_clear_db(callback: types.CallbackQuery):
     conn = None
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('DELETE FROM clients')
         conn.commit()
@@ -735,9 +757,9 @@ async def process_broadcast(message: types.Message, state: FSMContext):
     
     conn = None
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM clients')
+        cursor.execute('SELECT user_id FROM clients WHERE is_admin = FALSE')
         clients = cursor.fetchall()
         
         total = len(clients)
@@ -786,9 +808,9 @@ async def process_broadcast(message: types.Message, state: FSMContext):
 async def chat_with_client_start(message: types.Message, state: FSMContext):
     conn = None
     try:
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT user_id, full_name FROM clients WHERE is_admin = 0 ORDER BY timestamp DESC LIMIT 50')
+        cursor.execute('SELECT user_id, full_name FROM clients WHERE is_admin = FALSE ORDER BY timestamp DESC LIMIT 50')
         clients = cursor.fetchall()
         
         if not clients:
@@ -879,16 +901,14 @@ async def forward_to_client(message: types.Message, state: FSMContext):
 async def detailed_clients_report(message: types.Message):
     conn = None
     try:
-        await update_admin_activity(message.from_user.id)
-        
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
         SELECT user_id, username, full_name, timestamp, appreciate, dislike, 
                improve, gender, age_group, visit_freq
         FROM clients
-        WHERE is_admin = 0
+        WHERE is_admin = FALSE
         ORDER BY timestamp DESC
         LIMIT 50
         ''')
@@ -900,15 +920,15 @@ async def detailed_clients_report(message: types.Message):
             return
             
         # Формируем отчет
-        report_parts = ["📋 Подробный отчёт по клиентам\n"]
+        report_parts = ["📋 Подробный отчёт по клиентам (последние 50)\n"]
         for client in clients:
             client_info = [
                 f"👤 {client[2]} (@{client[1]})",
                 f"🆔 ID: {client[0]}",
                 f"📅 Дата: {client[3]}",
-                f"🧑‍🤝‍🧑 Пол: {client[6]}",
-                f"📊 Возраст: {client[7]}",
-                f"🛒 Посещения: {client[8]}",
+                f"🧑‍🤝‍🧑 Пол: {client[7]}",
+                f"📊 Возраст: {client[8]}",
+                f"🛒 Посещения: {client[9]}",
                 f"👍 Нравится: {client[4]}",
                 f"👎 Не нравится: {client[5]}",
                 f"💡 Предложения: {client[6]}",
@@ -916,9 +936,17 @@ async def detailed_clients_report(message: types.Message):
             ]
             report_parts.extend(client_info)
         
-        # Отправляем частями
+        # Разбиваем отчет на части, чтобы избежать ограничения длины сообщения
+        current_message = ""
         for part in report_parts:
-            await message.answer(part)
+            if len(current_message) + len(part) > 4000:
+                await message.answer(current_message)
+                current_message = part + "\n"
+            else:
+                current_message += part + "\n"
+        
+        if current_message:
+            await message.answer(current_message)
 
     except sqlite3.Error as e:
         logger.error(f"Ошибка базы данных: {e}")
@@ -949,9 +977,9 @@ async def forward_client_message(message: types.Message):
             
         user_id = message.from_user.id
         
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('SELECT 1 FROM clients WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT 1 FROM clients WHERE user_id = %s', (user_id,))
         is_client = cursor.fetchone() is not None
         
         if is_client and not is_admin(user_id):
@@ -975,13 +1003,13 @@ async def debug_info(message: types.Message):
         user_id = message.from_user.id
         is_adm = is_admin(user_id)
         
-        conn = sqlite3.connect('bot_database.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         
-        cursor.execute('SELECT * FROM admins WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT * FROM admins WHERE user_id = %s', (user_id,))
         admin_data = cursor.fetchone()
         
-        cursor.execute('SELECT * FROM clients WHERE user_id = ?', (user_id,))
+        cursor.execute('SELECT * FROM clients WHERE user_id = %s', (user_id,))
         client_data = cursor.fetchone()
         
         response = (
