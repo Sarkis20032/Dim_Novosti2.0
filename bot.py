@@ -223,7 +223,7 @@ async def notify_admins(text: str, exclude_id=None):
 
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 
-@dp.message(lambda m: is_admin(m.from_user.id)
+@dp.message(lambda m: is_admin(m.from_user.id))
 async def admin_reply_to_client(message: types.Message, state: FSMContext):
     # Если админ не в режиме чата с клиентом, предлагаем начать чат
     current_state = await state.get_state()
