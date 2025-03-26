@@ -533,7 +533,7 @@ async def list_admins(message: types.Message):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(''
+        cursor.execute('''
         SELECT a.user_id, a.username, u.username as added_by_username, a.added_at
         FROM admins a
         LEFT JOIN admins u ON a.added_by = u.user_id
