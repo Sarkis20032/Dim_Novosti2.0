@@ -209,7 +209,7 @@ async def notify_admins(text: str, exclude_id=None):
         
         for admin in admins:
             admin_id = admin[0]
-            if admin_id == exclude_id:
+            if exclude_id and admin_id == exclude_id:
                 continue
             try:
                 await bot.send_message(admin_id, text)
@@ -222,6 +222,17 @@ async def notify_admins(text: str, exclude_id=None):
             conn.close()
 
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
+
+@dp.message(lambda m: is_admin(m.from_user.id)
+async def admin_reply_to_client(message: types.Message, state: FSMContext):
+    # Если админ не в режиме чата с клиентом, предлагаем начать чат
+    current_state = await state.get_state()
+    if current_state != AdminStates.ADMIN_CHATTING:
+        await message.answer(
+            "Вы можете ответить клиенту:\n"
+            "1. Используйте команду /admin и выберите '💬 Чат с клиентом'\n"
+            "2. Или напишите reply на сообщение клиента (ответьте на пересланное сообщение)"
+        )
 
 @dp.message(Command('start'))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -449,23 +460,24 @@ async def process_visit_freq(message: types.Message, state: FSMContext):
             )
             await notify_admins(admin_message)
         
-        # Отправляем благодарность пользователю
-        response = (
-            "Благодарю!\n"
-            "📞 8-918-5567-53-33\n"
-            "Вот мой номер телефона, по нему вы всегда можете позвонить если вам будет чем поделиться, "
-            "так же можете писать WhatsApp или Telegram\n\n"
-            "Если вы захотите узнать что-то касательно наличия, цен, вкусов или чего угодно касательно магазина "
-            "вы можете написать нам в чат https://t.me/+BR14rdoGA91mZjdi"
-        )
-        
-        # Добавляем информацию об админ-панели только для админов
-        if user_data.get('is_admin', False):
-            response += "\n\nВы можете перейти в админ-панель: /admin"
-        
-        await message.answer(response, reply_markup=ReplyKeyboardRemove())
-            
-        await state.clear()
+# Обновляем финальное сообщение
+    response = (
+        "Благодарю за ваши ответы! 🙏\n\n"
+        "📞 Мой номер телефона: 8-918-5567-53-33\n\n"
+        "Вы можете:\n"
+        "1. Позвонить мне напрямую\n"
+        "2. Написать в WhatsApp или Telegram\n"
+        "3. Отправить сообщение прямо здесь в чате - я отвечу лично\n\n"
+        "Также вы можете присоединиться к нашему чату для обсуждения ассортимента, цен и новостей:\n"
+        "👉 https://t.me/+BR14rdoGA91mZjdi"
+    )
+    
+    # Добавляем информацию об админ-панели только для админов
+    if user_data.get('is_admin', False):
+        response += "\n\nВы можете перейти в админ-панель: /admin"
+    
+    await message.answer(response, reply_markup=ReplyKeyboardRemove())
+    await state.clear()
     except Exception as e:
         logger.error(f"Ошибка в обработке VISIT_FREQ: {e}")
         await message.answer("⚠️ Произошла ошибка. Пожалуйста, попробуйте снова.")
@@ -1038,13 +1050,28 @@ async def forward_client_message(message: types.Message):
         is_client = cursor.fetchone() is not None
         
         if is_client and not is_admin(user_id):
-            user_info = f"👤 {message.from_user.full_name} (@{message.from_user.username}, ID: {user_id})"
+            user_info = (
+                f"✉️ Новое сообщение от клиента:\n"
+                f"👤 Имя: {message.from_user.full_name}\n"
+                f"📌 Username: @{message.from_user.username}\n"
+                f"🆔 ID: {user_id}\n\n"
+                f"📩 Текст сообщения:\n{message.text}"
+            )
+            
+            # Отправляем всем админам, включая главного
             await notify_admins(
-                f"✉️ Сообщение от клиента:\n{user_info}\n\n{message.text}",
-                exclude_id=user_id
+                user_info,
+                exclude_id=None  # Убираем исключение, чтобы сообщения шли всем
+            )
+            
+            # Подтверждение клиенту
+            await message.answer(
+                "✅ Ваше сообщение отправлено администраторам. "
+                "Мы ответим вам в ближайшее время."
             )
     except Exception as e:
         logger.error(f"Ошибка пересылки сообщения: {e}")
+        await message.answer("⚠️ Произошла ошибка при отправке сообщения.")
     finally:
         if conn:
             conn.close()
