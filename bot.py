@@ -33,6 +33,8 @@ if not API_TOKEN:
     logger.critical("Не установлен TELEGRAM_BOT_TOKEN!")
     sys.exit(1)
 
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0"))
+
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -196,7 +198,7 @@ def is_admin(user_id: int) -> bool:
 
 # Проверка на главного администратора
 def is_super_admin(user_id: int) -> bool:
-    return user_id == 641521378
+    return user_id == SUPER_ADMIN_ID
 
 # Уведомление админов
 async def notify_admins(text: str, exclude_id=None):
